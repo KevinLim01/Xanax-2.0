@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -9,12 +9,10 @@ import requests
 
 
 def _secret(name: str, default: str = "") -> str:
-    # 1. Try normal environment variable first
     val = os.getenv(name)
     if val:
         return str(val).strip()
 
-    # 2. Try Streamlit secrets directly
     try:
         import streamlit as st
 
@@ -49,9 +47,9 @@ def _headers() -> dict[str, str]:
 
 def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     url = f"{_base_url()}{path}"
-    r = requests.get(url, headers=_headers(), params=params or {}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    response = requests.get(url, headers=_headers(), params=params or {}, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
 def get_account() -> dict[str, Any]:
@@ -75,22 +73,79 @@ def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> pd.DataF
     timestamps = data.get("timestamp") or []
     equity = data.get("equity") or []
 
-    if not timestamps or not equity:
-        return pd.DataFrame(columns=["time", "equity"])
-
     rows = []
 
     for ts, eq in zip(timestamps, equity):
         try:
-            t = datetime.fromtimestamp(int(ts))
-            v = float(eq) if eq is not None else None
+            rows.append(
+                {
+                    "time": datetime.fromtimestamp(int(ts)),
+                    "equity": float(eq),
+                }
+            )
         except Exception:
             continue
 
-        if v is not None:
-            rows.append({"time": t, "equity": v})
+    return pd.DataFrame(rows)
+
+
+def get_trade_activities(days_back: int = 400) -> pd.DataFrame:
+    after = (datetime.utcnow() - timedelta(days=days_back)).isoformat() + "Z"
+
+    try:
+        data = _get(
+            "/v2/account/activities/FILL",
+            {
+                "after": after,
+                "direction": "asc",
+                "page_size": 100,
+            },
+        )
+    except Exception:
+        return pd.DataFrame(columns=["time", "symbol", "side", "qty", "price"])
+
+    rows = []
+
+    for item in data:
+        try:
+            rows.append(
+                {
+                    "time": pd.to_datetime(item.get("transaction_time")).to_pydatetime(),
+                    "symbol": str(item.get("symbol", "")).upper(),
+                    "side": str(item.get("side", "")).lower(),
+                    "qty": float(item.get("qty") or 0),
+                    "price": float(item.get("price") or 0),
+                }
+            )
+        except Exception:
+            continue
 
     return pd.DataFrame(rows)
+
+
+def filter_trades_for_chart(trades: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty or hist.empty:
+        return pd.DataFrame(columns=["time", "symbol", "side", "qty", "price", "equity"])
+
+    start = hist["time"].min()
+    end = hist["time"].max()
+
+    trades = trades[(trades["time"] >= start) & (trades["time"] <= end)].copy()
+
+    if trades.empty:
+        return pd.DataFrame(columns=["time", "symbol", "side", "qty", "price", "equity"])
+
+    hist_sorted = hist.sort_values("time")[["time", "equity"]].copy()
+    trades_sorted = trades.sort_values("time").copy()
+
+    merged = pd.merge_asof(
+        trades_sorted,
+        hist_sorted,
+        on="time",
+        direction="nearest",
+    )
+
+    return merged
 
 
 def positions_dataframe() -> pd.DataFrame:
