@@ -123,14 +123,8 @@ with st.container(border=False):
     except Exception:
         hist = pd.DataFrame(columns=["time", "equity"])
 
-    if hist.empty and equity:
-        hist = pd.DataFrame(
-            {
-                "time": pd.date_range(end=pd.Timestamp.now(), periods=12, freq="h"),
-                "equity": [equity] * 12,
-            }
-        )
-
+    if hist.empty:
+        st.info("No usable Alpaca portfolio history yet. Once Alpaca returns real equity or P/L history, the graph will move.")
     try:
         raw_trades = get_trade_activities(days_back=int(chart_settings["days_back"]))
         trade_points = filter_trades_for_chart(raw_trades, hist)
