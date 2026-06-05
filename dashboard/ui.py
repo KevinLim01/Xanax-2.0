@@ -43,131 +43,79 @@ def pct(x: Any) -> str:
 
 def clean_chart(df: pd.DataFrame, trades: pd.DataFrame | None = None) -> go.Figure:
     """
-    Main chart helper.
+    Clean portfolio chart.
 
-    Supports two chart types:
+    Expected main dataframe:
+      time
+      equity
 
-    1. Portfolio equity chart:
-       df columns: time, equity
-       trade markers use trades["equity"]
+    Trade markers:
+      time
+      symbol
+      side
+      qty
+      price
+      equity
 
-    2. Individual ticker price-path chart:
-       df columns: time, close, open, high, low, volume
-       trade markers use trades["price"]
-
-    This fixes the old problem where the graph only showed BUY/SELL points.
-    Now the chart can show the actual stock movement while the trade was open.
+    This chart does not fill to zero. It zooms into actual portfolio movement.
     """
 
     fig = go.Figure()
 
-    if df is None or df.empty:
+    if df is None or df.empty or "time" not in df.columns or "equity" not in df.columns:
         fig.add_trace(go.Scatter(x=[], y=[]))
-        _apply_chart_layout(fig)
+        _apply_chart_layout(fig, None)
         return fig
 
     df = df.copy()
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = df.dropna(subset=["time"]).sort_values("time")
+    df["equity"] = pd.to_numeric(df["equity"], errors="coerce")
+    df = df.dropna(subset=["time", "equity"]).sort_values("time")
 
-    is_price_path = "close" in df.columns
-    is_equity_path = "equity" in df.columns
-
-    if is_price_path:
-        y_col = "close"
-        chart_name = "Stock Price"
-        hovertemplate = "$%{y:,.2f}<extra></extra>"
-
-        fig.add_trace(
-            go.Scatter(
-                x=df["time"],
-                y=df[y_col],
-                mode="lines",
-                line={
-                    "width": 4,
-                    "color": "#00e676",
-                    "shape": "spline",
-                    "smoothing": 1.2,
-                },
-                fill="tozeroy",
-                fillcolor="rgba(0,230,118,0.10)",
-                hovertemplate=hovertemplate,
-                name=chart_name,
-            )
-        )
-
-        # Optional high/low range shading, if available
-        if {"high", "low"}.issubset(df.columns):
-            fig.add_trace(
-                go.Scatter(
-                    x=df["time"],
-                    y=df["high"],
-                    mode="lines",
-                    line={"width": 0},
-                    hoverinfo="skip",
-                    showlegend=False,
-                    name="High",
-                )
-            )
-
-            fig.add_trace(
-                go.Scatter(
-                    x=df["time"],
-                    y=df["low"],
-                    mode="lines",
-                    line={"width": 0},
-                    fill="tonexty",
-                    fillcolor="rgba(255,255,255,0.045)",
-                    hoverinfo="skip",
-                    showlegend=False,
-                    name="Low",
-                )
-            )
-
-    elif is_equity_path:
-        y_col = "equity"
-        chart_name = "Net Worth"
-        hovertemplate = "$%{y:,.2f}<extra></extra>"
-
-        fig.add_trace(
-            go.Scatter(
-                x=df["time"],
-                y=df[y_col],
-                mode="lines",
-                line={
-                    "width": 4,
-                    "color": "#00e676",
-                    "shape": "spline",
-                    "smoothing": 1.2,
-                },
-                fill="tozeroy",
-                fillcolor="rgba(0,230,118,0.12)",
-                hovertemplate=hovertemplate,
-                name=chart_name,
-            )
-        )
-
-    else:
+    if df.empty:
         fig.add_trace(go.Scatter(x=[], y=[]))
-        _apply_chart_layout(fig)
+        _apply_chart_layout(fig, None)
         return fig
+
+    fig.add_trace(
+        go.Scatter(
+            x=df["time"],
+            y=df["equity"],
+            mode="lines",
+            line={
+                "width": 3,
+                "color": "#00e676",
+            },
+            hovertemplate=(
+                "%{x|%b %d, %I:%M %p}<br>"
+                "Portfolio: $%{y:,.2f}"
+                "<extra></extra>"
+            ),
+            name="Portfolio value",
+        )
+    )
 
     if trades is not None and not trades.empty:
         marker_df = trades.copy()
-        marker_df["time"] = pd.to_datetime(marker_df["time"], errors="coerce")
-        marker_df = marker_df.dropna(subset=["time"])
+
+        if "time" in marker_df.columns:
+            marker_df["time"] = pd.to_datetime(marker_df["time"], errors="coerce")
+        else:
+            marker_df["time"] = pd.NaT
+
+        if "equity" in marker_df.columns:
+            marker_df["equity"] = pd.to_numeric(marker_df["equity"], errors="coerce")
+        else:
+            marker_df["equity"] = None
 
         if "side" in marker_df.columns:
             marker_df["side"] = marker_df["side"].astype(str).str.lower()
         else:
             marker_df["side"] = ""
 
-        if is_price_path:
-            marker_y_col = "price"
-        else:
-            marker_y_col = "equity"
+        marker_df = marker_df.dropna(subset=["time", "equity"])
 
-        if marker_y_col in marker_df.columns:
+        if not marker_df.empty:
             buys = marker_df[marker_df["side"] == "buy"].copy()
             sells = marker_df[marker_df["side"] == "sell"].copy()
 
@@ -175,10 +123,10 @@ def clean_chart(df: pd.DataFrame, trades: pd.DataFrame | None = None) -> go.Figu
                 fig.add_trace(
                     go.Scatter(
                         x=buys["time"],
-                        y=buys[marker_y_col],
+                        y=buys["equity"],
                         mode="markers",
                         marker={
-                            "size": 13,
+                            "size": 8,
                             "symbol": "triangle-up",
                             "color": "#00e676",
                             "line": {"width": 1, "color": "#06110a"},
@@ -187,7 +135,9 @@ def clean_chart(df: pd.DataFrame, trades: pd.DataFrame | None = None) -> go.Figu
                         hovertemplate=(
                             "BUY %{customdata[0]}<br>"
                             "Qty: %{customdata[1]}<br>"
-                            "Price: $%{customdata[2]:,.2f}<extra></extra>"
+                            "Fill: $%{customdata[2]:,.2f}<br>"
+                            "Portfolio: $%{y:,.2f}"
+                            "<extra></extra>"
                         ),
                         name="Buy",
                     )
@@ -197,10 +147,10 @@ def clean_chart(df: pd.DataFrame, trades: pd.DataFrame | None = None) -> go.Figu
                 fig.add_trace(
                     go.Scatter(
                         x=sells["time"],
-                        y=sells[marker_y_col],
+                        y=sells["equity"],
                         mode="markers",
                         marker={
-                            "size": 13,
+                            "size": 8,
                             "symbol": "triangle-down",
                             "color": "#ff5c5c",
                             "line": {"width": 1, "color": "#150707"},
@@ -209,42 +159,15 @@ def clean_chart(df: pd.DataFrame, trades: pd.DataFrame | None = None) -> go.Figu
                         hovertemplate=(
                             "SELL %{customdata[0]}<br>"
                             "Qty: %{customdata[1]}<br>"
-                            "Price: $%{customdata[2]:,.2f}<extra></extra>"
+                            "Fill: $%{customdata[2]:,.2f}<br>"
+                            "Portfolio: $%{y:,.2f}"
+                            "<extra></extra>"
                         ),
                         name="Sell",
                     )
                 )
 
-        # Optional special event markers:
-        # event_type examples: history_peak, stop_loss, model_flip, friday_exit
-        if is_price_path and {"event_type", "price"}.issubset(marker_df.columns):
-            events = marker_df[
-                ~marker_df["event_type"].fillna("").astype(str).eq("")
-            ].copy()
-
-            if not events.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=events["time"],
-                        y=events["price"],
-                        mode="markers",
-                        marker={
-                            "size": 11,
-                            "symbol": "diamond",
-                            "color": "#ffd166",
-                            "line": {"width": 1, "color": "#171100"},
-                        },
-                        customdata=_event_customdata(events),
-                        hovertemplate=(
-                            "%{customdata[0]}<br>"
-                            "%{customdata[1]}<br>"
-                            "Price: $%{y:,.2f}<extra></extra>"
-                        ),
-                        name="Trade Event",
-                    )
-                )
-
-    _apply_chart_layout(fig)
+    _apply_chart_layout(fig, df)
     return fig
 
 
@@ -258,36 +181,45 @@ def _marker_customdata(df: pd.DataFrame) -> pd.DataFrame:
     return out[["symbol", "qty", "price"]]
 
 
-def _event_customdata(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame()
+def _apply_chart_layout(fig: go.Figure, df: pd.DataFrame | None = None) -> None:
+    y_range = None
 
-    out["event_type"] = df["event_type"] if "event_type" in df.columns else ""
-    out["reason"] = df["reason"] if "reason" in df.columns else ""
+    if df is not None and not df.empty and "equity" in df.columns:
+        y_min = float(df["equity"].min())
+        y_max = float(df["equity"].max())
 
-    return out[["event_type", "reason"]]
+        if y_min == y_max:
+            pad = max(abs(y_min) * 0.002, 10)
+        else:
+            pad = max((y_max - y_min) * 0.35, 5)
 
+        y_range = [y_min - pad, y_max + pad]
 
-def _apply_chart_layout(fig: go.Figure) -> None:
     fig.update_layout(
         height=390,
-        margin={"l": 0, "r": 0, "t": 8, "b": 0},
+        margin={"l": 8, "r": 8, "t": 10, "b": 28},
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         showlegend=False,
         hovermode="x unified",
         xaxis={
-            "visible": False,
             "showgrid": False,
             "zeroline": False,
-            "showticklabels": False,
+            "showline": False,
+            "showticklabels": True,
+            "tickfont": {"color": "#8b949e", "size": 10},
             "fixedrange": True,
         },
         yaxis={
-            "visible": False,
-            "showgrid": False,
+            "showgrid": True,
+            "gridcolor": "rgba(255,255,255,0.07)",
             "zeroline": False,
-            "showticklabels": False,
+            "showline": False,
+            "showticklabels": True,
+            "tickfont": {"color": "#8b949e", "size": 10},
+            "tickprefix": "$",
             "fixedrange": True,
+            "range": y_range,
         },
     )
 
