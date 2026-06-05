@@ -1,0 +1,11 @@
+{
+  "input_path": "data/xanax_no_weekend_2y_simulation_trades.csv",
+  "output_path": "data/simulation_live_filter_summary.csv",
+  "rows": 667,
+  "source_trades": 1159,
+  "min_sample_size": 20,
+  "max_adjustment": 10,
+  "positive_adjustment_rows": 18,
+  "negative_adjustment_rows": 0,
+  "block_rows": 0
+}
