@@ -67,26 +67,74 @@ def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> pd.DataF
             "period": period,
             "timeframe": timeframe,
             "intraday_reporting": "continuous",
+            "pnl_reset": "no_reset",
         },
     )
 
     timestamps = data.get("timestamp") or []
-    equity = data.get("equity") or []
+    equity_values = data.get("equity") or []
+    profit_loss_values = data.get("profit_loss") or []
 
     rows = []
 
-    for ts, eq in zip(timestamps, equity):
+    for ts, eq in zip(timestamps, equity_values):
         try:
+            if eq is None:
+                continue
+
             rows.append(
                 {
                     "time": datetime.fromtimestamp(int(ts)),
                     "equity": float(eq),
+                    "source": "equity",
                 }
             )
         except Exception:
             continue
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    if not df.empty and df["equity"].nunique() > 1:
+        return df
+
+    if timestamps and profit_loss_values:
+        try:
+            account = get_account()
+            current_equity = float(
+                account.get("equity")
+                or account.get("portfolio_value")
+                or 0
+            )
+
+            pnl_clean = []
+
+            for pnl in profit_loss_values:
+                try:
+                    pnl_clean.append(float(pnl or 0))
+                except Exception:
+                    pnl_clean.append(0.0)
+
+            if pnl_clean and current_equity:
+                latest_pnl = pnl_clean[-1]
+                rebuilt_rows = []
+
+                for ts, pnl in zip(timestamps, pnl_clean):
+                    rebuilt_rows.append(
+                        {
+                            "time": datetime.fromtimestamp(int(ts)),
+                            "equity": current_equity - latest_pnl + pnl,
+                            "source": "profit_loss",
+                        }
+                    )
+
+                rebuilt_df = pd.DataFrame(rebuilt_rows)
+
+                if not rebuilt_df.empty and rebuilt_df["equity"].nunique() > 1:
+                    return rebuilt_df
+        except Exception:
+            pass
+
+    return pd.DataFrame(columns=["time", "equity", "source"])
 
 
 def get_trade_activities(days_back: int = 400) -> pd.DataFrame:
