@@ -64,31 +64,26 @@ def _data_get(path: str, params: dict[str, Any] | None = None) -> Any:
 
 
 def _to_utc_iso(value: datetime | str) -> str:
-    if isinstance(value, str):
-        dt = pd.to_datetime(value)
-        if dt.tzinfo is None:
-            dt = dt.tz_localize("UTC")
-        else:
-            dt = dt.tz_convert("UTC")
-        return dt.isoformat().replace("+00:00", "Z")
-
-    dt = value
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-
+    dt = pd.to_datetime(value, utc=True)
     return dt.isoformat().replace("+00:00", "Z")
 
 
 def _safe_datetime(value: Any) -> datetime | None:
     try:
-        dt = pd.to_datetime(value)
+        dt = pd.to_datetime(value, utc=True)
         if pd.isna(dt):
             return None
         return dt.to_pydatetime()
     except Exception:
         return None
+
+
+def _empty_equity_curve() -> pd.DataFrame:
+    return pd.DataFrame(columns=["time", "equity", "source"])
+
+
+def _empty_trades() -> pd.DataFrame:
+    return pd.DataFrame(columns=["time", "symbol", "side", "qty", "price"])
 
 
 def get_account() -> dict[str, Any]:
@@ -123,9 +118,9 @@ def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> pd.DataF
 
             rows.append(
                 {
-                    "time": datetime.fromtimestamp(int(ts)),
+                    "time": pd.to_datetime(int(ts), unit="s", utc=True),
                     "equity": float(eq),
-                    "source": "equity",
+                    "source": "alpaca_equity",
                 }
             )
         except Exception:
@@ -134,7 +129,7 @@ def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> pd.DataF
     df = pd.DataFrame(rows)
 
     if not df.empty and df["equity"].nunique() > 1:
-        return df
+        return df.sort_values("time").reset_index(drop=True)
 
     if timestamps and profit_loss_values:
         try:
@@ -160,24 +155,27 @@ def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> pd.DataF
                 for ts, pnl in zip(timestamps, pnl_clean):
                     rebuilt_rows.append(
                         {
-                            "time": datetime.fromtimestamp(int(ts)),
+                            "time": pd.to_datetime(int(ts), unit="s", utc=True),
                             "equity": current_equity - latest_pnl + pnl,
-                            "source": "profit_loss",
+                            "source": "alpaca_profit_loss",
                         }
                     )
 
                 rebuilt_df = pd.DataFrame(rebuilt_rows)
 
                 if not rebuilt_df.empty and rebuilt_df["equity"].nunique() > 1:
-                    return rebuilt_df
+                    return rebuilt_df.sort_values("time").reset_index(drop=True)
         except Exception:
             pass
 
-    return pd.DataFrame(columns=["time", "equity", "source"])
+    return _empty_equity_curve()
 
 
 def get_trade_activities(days_back: int = 400) -> pd.DataFrame:
-    after = (datetime.utcnow() - timedelta(days=days_back)).isoformat() + "Z"
+    after = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat().replace(
+        "+00:00",
+        "Z",
+    )
 
     try:
         data = _get(
@@ -189,7 +187,7 @@ def get_trade_activities(days_back: int = 400) -> pd.DataFrame:
             },
         )
     except Exception:
-        return pd.DataFrame(columns=["time", "symbol", "side", "qty", "price"])
+        return _empty_trades()
 
     rows = []
 
@@ -202,8 +200,8 @@ def get_trade_activities(days_back: int = 400) -> pd.DataFrame:
             rows.append(
                 {
                     "time": dt,
-                    "symbol": str(item.get("symbol", "")).upper(),
-                    "side": str(item.get("side", "")).lower(),
+                    "symbol": str(item.get("symbol", "")).upper().strip(),
+                    "side": str(item.get("side", "")).lower().strip(),
                     "qty": float(item.get("qty") or 0),
                     "price": float(item.get("price") or 0),
                 }
@@ -211,7 +209,14 @@ def get_trade_activities(days_back: int = 400) -> pd.DataFrame:
         except Exception:
             continue
 
-    return pd.DataFrame(rows)
+    if not rows:
+        return _empty_trades()
+
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["time"])
+
+    return df.sort_values("time").reset_index(drop=True)
 
 
 def get_ticker_price_path(
@@ -221,13 +226,6 @@ def get_ticker_price_path(
     timeframe: str = "5Min",
     feed: str = "iex",
 ) -> pd.DataFrame:
-    """
-    Gets actual stock price movement while a trade was open.
-
-    This is what the graph should use as the main line/candles.
-    Alpaca trade activities should only be used as BUY/SELL markers.
-    """
-
     symbol = str(symbol or "").upper().strip()
 
     if not symbol:
@@ -255,7 +253,6 @@ def get_ticker_price_path(
         )
 
     bars = data.get("bars") or []
-
     rows = []
 
     for bar in bars:
@@ -278,216 +275,187 @@ def get_ticker_price_path(
         except Exception:
             continue
 
-    df = pd.DataFrame(rows)
-
-    if df.empty:
+    if not rows:
         return pd.DataFrame(
             columns=["time", "symbol", "open", "high", "low", "close", "volume"]
         )
 
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["time"])
+
     return df.sort_values("time").reset_index(drop=True)
 
 
-def infer_trade_windows(trades: pd.DataFrame) -> pd.DataFrame:
+def build_mark_to_market_equity_curve(
+    trades: pd.DataFrame,
+    current_equity: float,
+    days_back: int = 10,
+    timeframe: str = "5Min",
+    feed: str = "iex",
+) -> pd.DataFrame:
     """
-    Turns raw BUY/SELL fills into open trade windows.
+    Builds the main dashboard graph from each stock's actual price movement.
 
-    Example:
-    BUY BKNG Monday 10:02
-    SELL BKNG Wednesday 11:14
+    This is the correct graph:
+    cash + sum(qty held per ticker * ticker close price at each timestamp)
 
-    Result:
-    BKNG open_time=Monday 10:02, close_time=Wednesday 11:14
+    This means every held stock is calculated individually, then combined into
+    one final portfolio curve.
     """
 
-    if trades.empty:
-        return pd.DataFrame(
-            columns=[
-                "symbol",
-                "open_time",
-                "close_time",
-                "entry_price",
-                "exit_price",
-                "entry_qty",
-                "exit_qty",
-                "is_open",
-            ]
-        )
+    if trades is None or trades.empty:
+        return _empty_equity_curve()
+
+    now = datetime.now(timezone.utc)
+    start_time = now - timedelta(days=int(days_back))
+
+    fills = trades.copy()
 
     required = {"time", "symbol", "side", "qty", "price"}
-    if not required.issubset(set(trades.columns)):
-        return pd.DataFrame(
-            columns=[
-                "symbol",
-                "open_time",
-                "close_time",
-                "entry_price",
-                "exit_price",
-                "entry_qty",
-                "exit_qty",
-                "is_open",
-            ]
+    if not required.issubset(set(fills.columns)):
+        return _empty_equity_curve()
+
+    fills["time"] = pd.to_datetime(fills["time"], utc=True, errors="coerce")
+    fills = fills.dropna(subset=["time"])
+
+    fills["symbol"] = fills["symbol"].astype(str).str.upper().str.strip()
+    fills["side"] = fills["side"].astype(str).str.lower().str.strip()
+    fills["qty"] = pd.to_numeric(fills["qty"], errors="coerce").fillna(0.0)
+    fills["price"] = pd.to_numeric(fills["price"], errors="coerce").fillna(0.0)
+
+    fills = fills[
+        (fills["symbol"] != "")
+        & (fills["qty"] > 0)
+        & (fills["price"] > 0)
+        & (fills["side"].isin(["buy", "sell"]))
+    ].copy()
+
+    if fills.empty:
+        return _empty_equity_curve()
+
+    symbols = sorted(fills["symbol"].unique().tolist())
+    bar_frames = []
+
+    for symbol in symbols:
+        bars = get_ticker_price_path(
+            symbol=symbol,
+            start_time=start_time,
+            end_time=now,
+            timeframe=timeframe,
+            feed=feed,
         )
 
-    rows = []
-    open_lots: dict[str, dict[str, Any]] = {}
-
-    df = trades.copy()
-    df["symbol"] = df["symbol"].astype(str).str.upper()
-    df["side"] = df["side"].astype(str).str.lower()
-    df = df.sort_values("time")
-
-    for _, trade in df.iterrows():
-        symbol = str(trade["symbol"]).upper()
-        side = str(trade["side"]).lower()
-        qty = float(trade.get("qty") or 0)
-        price = float(trade.get("price") or 0)
-        time = trade.get("time")
-
-        if not symbol or qty <= 0 or price <= 0:
+        if bars.empty:
             continue
 
-        if side == "buy":
-            if symbol not in open_lots:
-                open_lots[symbol] = {
-                    "symbol": symbol,
-                    "open_time": time,
-                    "entry_price": price,
-                    "entry_qty": qty,
-                    "remaining_qty": qty,
-                }
-            else:
-                lot = open_lots[symbol]
-                old_qty = float(lot["remaining_qty"])
-                new_qty = old_qty + qty
+        bars = bars.copy()
+        bars["time"] = pd.to_datetime(bars["time"], utc=True, errors="coerce")
+        bars = bars.dropna(subset=["time"])
+        bars["close"] = pd.to_numeric(bars["close"], errors="coerce")
+        bars = bars.dropna(subset=["close"])
+        bars["symbol"] = symbol
 
-                lot["entry_price"] = (
-                    float(lot["entry_price"]) * old_qty + price * qty
-                ) / new_qty
-                lot["entry_qty"] = float(lot["entry_qty"]) + qty
-                lot["remaining_qty"] = new_qty
+        if not bars.empty:
+            bar_frames.append(bars[["time", "symbol", "close"]])
 
-        elif side == "sell":
-            if symbol not in open_lots:
-                continue
+    if not bar_frames:
+        return _empty_equity_curve()
 
-            lot = open_lots[symbol]
-            remaining = float(lot["remaining_qty"])
-            sold_qty = min(qty, remaining)
-            new_remaining = remaining - sold_qty
+    bars_all = pd.concat(bar_frames, ignore_index=True)
+    bars_all = bars_all.sort_values(["symbol", "time"]).reset_index(drop=True)
 
-            if new_remaining <= 0.000001:
-                rows.append(
-                    {
-                        "symbol": symbol,
-                        "open_time": lot["open_time"],
-                        "close_time": time,
-                        "entry_price": float(lot["entry_price"]),
-                        "exit_price": price,
-                        "entry_qty": float(lot["entry_qty"]),
-                        "exit_qty": qty,
-                        "is_open": False,
-                    }
-                )
-                del open_lots[symbol]
-            else:
-                lot["remaining_qty"] = new_remaining
+    chart_times = sorted(set(bars_all["time"].tolist()))
 
-    for symbol, lot in open_lots.items():
+    if not chart_times:
+        return _empty_equity_curve()
+
+    rows = []
+
+    for t in chart_times:
+        fills_until_t = fills[fills["time"] <= t]
+
+        cash_flow = 0.0
+        holdings_value = 0.0
+
+        if not fills_until_t.empty:
+            for _, fill in fills_until_t.iterrows():
+                qty = float(fill["qty"])
+                price = float(fill["price"])
+                side = str(fill["side"])
+
+                if side == "buy":
+                    cash_flow -= qty * price
+                elif side == "sell":
+                    cash_flow += qty * price
+
+            for symbol in symbols:
+                symbol_fills = fills_until_t[fills_until_t["symbol"] == symbol]
+
+                if symbol_fills.empty:
+                    continue
+
+                bought = symbol_fills[symbol_fills["side"] == "buy"]["qty"].sum()
+                sold = symbol_fills[symbol_fills["side"] == "sell"]["qty"].sum()
+                qty_held = float(bought - sold)
+
+                if qty_held <= 0:
+                    continue
+
+                symbol_prices = bars_all[
+                    (bars_all["symbol"] == symbol)
+                    & (bars_all["time"] <= t)
+                ]
+
+                if symbol_prices.empty:
+                    continue
+
+                latest_price = float(symbol_prices["close"].iloc[-1])
+                holdings_value += qty_held * latest_price
+
         rows.append(
             {
-                "symbol": symbol,
-                "open_time": lot["open_time"],
-                "close_time": None,
-                "entry_price": float(lot["entry_price"]),
-                "exit_price": None,
-                "entry_qty": float(lot["entry_qty"]),
-                "exit_qty": None,
-                "is_open": True,
+                "time": t,
+                "cash_flow": cash_flow,
+                "holdings_value": holdings_value,
             }
         )
 
-    return pd.DataFrame(rows)
+    curve = pd.DataFrame(rows)
 
+    if curve.empty:
+        return _empty_equity_curve()
 
-def get_trade_price_path(
-    symbol: str,
-    open_time: datetime | str,
-    close_time: datetime | str | None = None,
-    timeframe: str = "5Min",
-) -> pd.DataFrame:
-    """
-    Convenience wrapper for dashboard charting.
+    latest_holdings = float(curve["holdings_value"].iloc[-1])
+    latest_cash_flow = float(curve["cash_flow"].iloc[-1])
 
-    Use this when the dashboard already knows the trade window.
-    """
+    cash_offset = float(current_equity or 0) - latest_holdings - latest_cash_flow
 
-    if close_time is None:
-        close_time = datetime.now(timezone.utc)
+    curve["equity"] = cash_offset + curve["cash_flow"] + curve["holdings_value"]
+    curve["source"] = "mark_to_market"
 
-    return get_ticker_price_path(
-        symbol=symbol,
-        start_time=open_time,
-        end_time=close_time,
-        timeframe=timeframe,
-    )
+    curve = curve[["time", "equity", "source"]].copy()
+    curve["time"] = pd.to_datetime(curve["time"], utc=True, errors="coerce")
+    curve = curve.dropna(subset=["time"])
 
-
-def build_trade_chart_data(
-    symbol: str,
-    trades: pd.DataFrame,
-    open_time: datetime | str,
-    close_time: datetime | str | None = None,
-    timeframe: str = "5Min",
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-    1. price_path_df = actual stock movement
-    2. marker_df = BUY/SELL markers
-
-    The dashboard should graph price_path_df as the main chart,
-    then overlay marker_df.
-    """
-
-    symbol = str(symbol or "").upper().strip()
-
-    price_path = get_trade_price_path(
-        symbol=symbol,
-        open_time=open_time,
-        close_time=close_time,
-        timeframe=timeframe,
-    )
-
-    if trades.empty:
-        markers = pd.DataFrame(columns=["time", "symbol", "side", "qty", "price"])
-    else:
-        markers = trades.copy()
-        markers["symbol"] = markers["symbol"].astype(str).str.upper()
-        markers = markers[markers["symbol"] == symbol].copy()
-
-        start_dt = pd.to_datetime(open_time)
-        end_dt = pd.to_datetime(close_time or datetime.now(timezone.utc))
-
-        markers["time"] = pd.to_datetime(markers["time"])
-        markers = markers[
-            (markers["time"] >= start_dt)
-            & (markers["time"] <= end_dt)
-        ].copy()
-
-        markers = markers.sort_values("time").reset_index(drop=True)
-
-    return price_path, markers
+    return curve.sort_values("time").reset_index(drop=True)
 
 
 def filter_trades_for_chart(trades: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
-    """
-    Old portfolio-equity marker helper.
+    if trades is None or hist is None or trades.empty or hist.empty:
+        return pd.DataFrame(columns=["time", "symbol", "side", "qty", "price", "equity"])
 
-    Keep this for the existing dashboard.
-    New ticker-specific charts should use:
-    - get_ticker_price_path()
-    - build_trade_chart_data()
-    """
+    if "time" not in trades.columns or "time" not in hist.columns:
+        return pd.DataFrame(columns=["time", "symbol", "side", "qty", "price", "equity"])
+
+    trades = trades.copy()
+    hist = hist.copy()
+
+    trades["time"] = pd.to_datetime(trades["time"], utc=True, errors="coerce")
+    hist["time"] = pd.to_datetime(hist["time"], utc=True, errors="coerce")
+
+    trades = trades.dropna(subset=["time"])
+    hist = hist.dropna(subset=["time"])
 
     if trades.empty or hist.empty:
         return pd.DataFrame(columns=["time", "symbol", "side", "qty", "price", "equity"])
