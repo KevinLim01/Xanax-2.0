@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-# Copy Streamlit Secrets into normal environment variables.
-# This lets your older model code read secrets with os.getenv().
 try:
     for key, value in st.secrets.items():
         os.environ[key] = str(value)
 except Exception:
     pass
 
-from dashboard.alpaca_client import get_account, get_portfolio_history, positions_dataframe
+from dashboard.alpaca_client import (
+    filter_trades_for_chart,
+    get_account,
+    get_portfolio_history,
+    get_trade_activities,
+    positions_dataframe,
+)
 from dashboard.command_runner import (
     execute_top_trades,
     latest_logs,
@@ -27,12 +30,6 @@ from dashboard.ui import apply_style, clean_chart, load_env, money, pct, scan_da
 
 load_env()
 apply_style()
-
-st.set_page_config(
-    page_title="XANAX Paper Trading Dashboard",
-    page_icon="📈",
-    layout="wide",
-)
 
 st.sidebar.markdown("# XANAX")
 st.sidebar.markdown("**PAPER TRADING DASHBOARD**")
@@ -54,7 +51,7 @@ max_slots = st.sidebar.number_input(
     "Max trade slots",
     min_value=1,
     max_value=25,
-    value=int(os.getenv("AUTO_TRADE_MAX_TRADES_PER_SCAN", os.getenv("DASHBOARD_MAX_TRADE_SLOTS", "5"))),
+    value=int(os.getenv("AUTO_TRADE_MAX_TRADES_PER_SCAN", "5")),
     step=1,
 )
 
@@ -73,7 +70,6 @@ st.sidebar.success("Run Monitor Check is always available.")
 
 st.title("XANAX Paper Trading Dashboard")
 
-# Account + chart
 account_error = None
 
 try:
@@ -88,40 +84,42 @@ last_equity = float(account.get("last_equity") or equity or 0)
 change = equity - last_equity
 change_pct = (change / last_equity * 100) if last_equity else 0
 
+range_choice = st.radio(
+    "Chart range",
+    ["1D", "1W", "1M", "1Y", "Total"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+range_map = {
+    "1D": {"period": "1D", "timeframe": "5Min", "days_back": 2},
+    "1W": {"period": "1W", "timeframe": "15Min", "days_back": 10},
+    "1M": {"period": "1M", "timeframe": "1H", "days_back": 40},
+    "1Y": {"period": "1A", "timeframe": "1D", "days_back": 370},
+    "Total": {"period": "all", "timeframe": "1D", "days_back": 1500},
+}
+
+chart_settings = range_map[range_choice]
+
 with st.container(border=False):
     st.markdown('<div class="hero">', unsafe_allow_html=True)
 
-    c1, c2 = st.columns([2.5, 1])
+    st.markdown("<div class='small-muted'>Net Worth</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='big-money'>{money(equity)}</div>", unsafe_allow_html=True)
 
-    with c1:
-        st.markdown("<div class='small-muted'>Net Worth</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='big-money'>{money(equity)}</div>", unsafe_allow_html=True)
+    klass = "gain" if change >= 0 else "loss"
+    sign = "+" if change >= 0 else ""
 
-        klass = "gain" if change >= 0 else "loss"
-        sign = "+" if change >= 0 else ""
-
-        st.markdown(
-            f"<div class='{klass}'>{sign}{money(change)} ({pct(change_pct)}) Today</div>",
-            unsafe_allow_html=True,
-        )
-
-    with c2:
-        chart_period = st.selectbox(
-            "Range",
-            ["1D", "1W", "1M", "3M", "1A", "all"],
-            index=2,
-            label_visibility="collapsed",
-        )
-
-        chart_timeframe = st.selectbox(
-            "Interval",
-            ["1Min", "5Min", "15Min", "1H", "1D"],
-            index=4,
-            label_visibility="collapsed",
-        )
+    st.markdown(
+        f"<div class='{klass}'>{sign}{money(change)} ({pct(change_pct)}) Today</div>",
+        unsafe_allow_html=True,
+    )
 
     try:
-        hist = get_portfolio_history(period=chart_period, timeframe=chart_timeframe)
+        hist = get_portfolio_history(
+            period=chart_settings["period"],
+            timeframe=chart_settings["timeframe"],
+        )
     except Exception:
         hist = pd.DataFrame(columns=["time", "equity"])
 
@@ -133,28 +131,25 @@ with st.container(border=False):
             }
         )
 
+    try:
+        raw_trades = get_trade_activities(days_back=int(chart_settings["days_back"]))
+        trade_points = filter_trades_for_chart(raw_trades, hist)
+    except Exception:
+        trade_points = pd.DataFrame(columns=["time", "symbol", "side", "qty", "price", "equity"])
+
     st.plotly_chart(
-        clean_chart(hist),
+        clean_chart(hist, trade_points),
         use_container_width=True,
         config={"displayModeBar": False},
     )
 
-    st.markdown(
-        "<span class='pill'>1D</span>"
-        "<span class='pill'>1W</span>"
-        "<span class='pill'>1M</span>"
-        "<span class='pill'>3M</span>"
-        "<span class='pill'>1Y</span>"
-        "<span class='pill'>ALL</span>",
-        unsafe_allow_html=True,
-    )
+    st.caption("Green triangles = buys. Red triangles = sells. Hover over them to see ticker, quantity, and price.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 if account_error:
     st.warning(f"Alpaca data not loaded: {account_error}")
 
-# Button actions
 if run_scan:
     st.info("Running scan chunks. This is manual and can take a while depending on your ticker list.")
 
