@@ -70,7 +70,7 @@ monitor = st.sidebar.button("Run Monitor Check", type="primary", use_container_w
 st.sidebar.success("Run Monitor Check is always available.")
 
 st.title("XANAX Paper Trading Dashboard")
-st.caption("Dashboard build: combined mark-to-market stock movement graph enabled.")
+st.caption("Dashboard build: interactive hover price graph enabled.")
 
 account_error = None
 
@@ -153,10 +153,65 @@ with st.container(border=False):
             columns=["time", "symbol", "side", "qty", "price", "equity"]
         )
 
+    fig = clean_chart(hist, trade_points)
+
+    try:
+        fig.update_layout(
+            hovermode="x unified",
+            spikedistance=-1,
+            hoverlabel=dict(
+                bgcolor="rgba(15, 23, 42, 0.95)",
+                font_size=13,
+            ),
+            xaxis=dict(
+                showspikes=True,
+                spikemode="across",
+                spikesnap="cursor",
+                spikethickness=1,
+            ),
+            yaxis=dict(
+                showspikes=True,
+                spikemode="across",
+                spikesnap="cursor",
+                spikethickness=1,
+                tickprefix="$",
+            ),
+        )
+
+        for trace in fig.data:
+            name = str(getattr(trace, "name", "") or "").lower()
+
+            if "buy" in name:
+                trace.hovertemplate = (
+                    "<b>BUY</b><br>"
+                    "Time: %{x}<br>"
+                    "Portfolio value: $%{y:,.2f}"
+                    "<extra></extra>"
+                )
+            elif "sell" in name:
+                trace.hovertemplate = (
+                    "<b>SELL</b><br>"
+                    "Time: %{x}<br>"
+                    "Portfolio value: $%{y:,.2f}"
+                    "<extra></extra>"
+                )
+            else:
+                trace.hovertemplate = (
+                    "Time: %{x}<br>"
+                    "Portfolio value: $%{y:,.2f}"
+                    "<extra></extra>"
+                )
+
+    except Exception:
+        pass
+
     st.plotly_chart(
-        clean_chart(hist, trade_points),
+        fig,
         use_container_width=True,
-        config={"displayModeBar": False},
+        config={
+            "displayModeBar": False,
+            "scrollZoom": False,
+        },
     )
 
     source_label = ""
@@ -168,11 +223,11 @@ with st.container(border=False):
 
     if source_label == "mark_to_market":
         st.caption(
-            "Graph = combined mark-to-market portfolio value from each held stock’s real price movement. Green triangles = buys. Red triangles = sells."
+            "Graph = combined mark-to-market portfolio value from each held stock’s real price movement. Hover over the graph to see value at that time. Green triangles = buys. Red triangles = sells."
         )
     else:
         st.caption(
-            "Graph = Alpaca portfolio history fallback. Green triangles = buys. Red triangles = sells."
+            "Graph = Alpaca portfolio history fallback. Hover over the graph to see value at that time. Green triangles = buys. Red triangles = sells."
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
