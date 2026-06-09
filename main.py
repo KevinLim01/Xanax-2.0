@@ -842,29 +842,135 @@ def _execute_ranked_trades(
     print(f"{len(filtered)} recommendation(s) passed the final filter.")
     if second_chance:
         print("Second-chance mode is enabled: only strongest Tuesday/Wednesday signals are eligible.")
-    print("Final executor will rank all chunks together and only then send eligible trades.")
+    print("Final executor will rank all chunks together, check real open slots, then send only selected trades.")
     print()
 
     _print_screen_table(filtered[:25])
 
-    trader = AutoTrader()
-    trades_attempted = 0
-
     from app.config import settings
+
     trade_limit = settings.auto_trade_max_trades_per_run
     if max_trade_slots is not None:
         trade_limit = min(trade_limit, max_trade_slots)
 
+    trader = AutoTrader()
+
+    def _setting_int(*names: str, default: int | None = None) -> int | None:
+        for name in names:
+            if hasattr(settings, name):
+                value = getattr(settings, name)
+                if value is not None:
+                    return _safe_int(value, default or 0)
+        return default
+
+    def _position_symbol(pos: Any) -> str:
+        if isinstance(pos, dict):
+            return normalize_ticker(str(pos.get("symbol", "")))
+        return normalize_ticker(str(getattr(pos, "symbol", "")))
+
+    def _active_position_symbols() -> set[str]:
+        symbols: set[str] = set()
+
+        broker = getattr(trader, "broker", None)
+        if broker is None:
+            broker = getattr(trader, "client", None)
+
+        if broker is None:
+            return symbols
+
+        methods = [
+            "get_all_positions",
+            "list_positions",
+            "get_positions",
+            "positions",
+        ]
+
+        for method_name in methods:
+            try:
+                method = getattr(broker, method_name, None)
+                if method is None:
+                    continue
+
+                positions = method() if callable(method) else method
+                if positions is None:
+                    continue
+
+                for pos in positions:
+                    symbol = _position_symbol(pos)
+                    if symbol:
+                        symbols.add(symbol)
+
+                if symbols:
+                    return symbols
+
+            except Exception:
+                continue
+
+        return symbols
+
+    max_active_positions = _setting_int(
+        "auto_trade_max_active_positions",
+        "auto_trade_max_positions",
+        "auto_trade_max_open_positions",
+        default=None,
+    )
+
+    active_symbols = _active_position_symbols()
+
+    if max_active_positions is not None and active_symbols:
+        open_slots = max(0, max_active_positions - len(active_symbols))
+
+        print(
+            f"Portfolio slots before execution: "
+            f"active={len(active_symbols)}, "
+            f"max_active={max_active_positions}, "
+            f"open={open_slots}"
+        )
+
+        trade_limit = min(trade_limit, open_slots)
+
+    if trade_limit <= 0:
+        print("No open portfolio slots before execution. Nothing sent to Alpaca.")
+        return 0
+
+    eligible_rows: list[dict] = []
+
     for row in filtered:
-        if trades_attempted >= trade_limit:
-            print(f"Auto-trade limit reached: {trade_limit}")
-            break
+        ticker = normalize_ticker(str(row.get("ticker", "")))
+
+        if ticker in active_symbols:
+            print(f"Skipping {ticker}: already has an active position.")
+            continue
 
         ok, reason = _passes_trade_safety_gate(row)
         if not ok:
-            print(f"Skipping {row.get('ticker', 'N/A')}: {reason}.")
+            print(f"Skipping {ticker or 'N/A'}: {reason}.")
             continue
 
+        eligible_rows.append(row)
+
+        if len(eligible_rows) >= trade_limit:
+            break
+
+    if not eligible_rows:
+        print("No ranked recommendations passed the final trade safety gate.")
+        return 0
+
+    print()
+    print(f"Selected {len(eligible_rows)} trade(s) for the actual open slot(s):")
+    for i, row in enumerate(eligible_rows, start=1):
+        print(
+            f"  {i}. {row.get('ticker', 'N/A')} | "
+            f"{row.get('final_action', 'WATCH')} | "
+            f"{row.get('forecast_direction', 'NEUTRAL')} | "
+            f"conviction={row.get('conviction_score', 0)} | "
+            f"setup={row.get('setup_type', 'NO_CLEAN_SETUP')}"
+        )
+    print()
+
+    trades_attempted = 0
+
+    for row in eligible_rows:
         did_attempt = trader.process_model_output(row, dry_run=dry_run)
         if did_attempt:
             trades_attempted += 1
